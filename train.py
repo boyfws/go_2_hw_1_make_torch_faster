@@ -17,7 +17,8 @@ class TromptCell(nn.Module):
     Что сделали: 
     1) Убрали материализацию torch.cat([self.ln_prompt(x_prompt), prev_cell_out], dim=-1) 
     и лишние вычсления с одинаковыми x_prompt (которые теперь и не материализуются)
-    2) Оптимизровали применение dense_expand и вычсиление reduce за счет изменения порядка операций на более оптимальный 
+    2) Оптимизровали применение dense_expand и вычсиление reduce за счет изменения порядка операций на более оптимальный
+    3) Перешли на функцию внимания от торча, чтобы можно было использовать разные backend-ы в тч оптмизированные  
     '''
     def __init__(self, n_columns, n_prompts, d_model):
         super().__init__()
@@ -76,16 +77,25 @@ class TromptCell(nn.Module):
 
 
 
-        x_column = self.ln_col(self.emb_column.unsqueeze(0).repeat(x_emb.shape[0], 1, 1))
-        mask = torch.softmax(x_prompt @ x_column.transpose(1,2), dim=-1)
+        x_column = self.ln_col(self.emb_column.unsqueeze(0))
 
+        x_out = F.scaled_dot_product_attention(
+            x_prompt.unsqueeze(1),                              
+            x_column.expand(x_emb.shape[0], -1, -1).unsqueeze(1),  
+            x_emb.unsqueeze(1),                                 
+            scale=1.0,
+        ).squeeze(1) 
 
-        x_out = torch.bmm(mask, x_emb)  # [B, P, D]
+        # Приводим к 4d layout чтобы flash attention запустился (пока хз заведется ли на t4)                               
 
         x_out = (
-            x_out * (1 + self.dense_expand.weight.squeeze(-1)).view(1, -1, 1)
-            + self.dense_expand.bias.view(1, -1, 1)
+            x_out * (
+                1 + self.dense_expand.weight.squeeze(-1)
+            )[None, :, None]
+
+            + self.dense_expand.bias   [None, :, None]
         )
+
         return x_out
 
 
