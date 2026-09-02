@@ -17,6 +17,7 @@ class TromptCell(nn.Module):
     Что сделали: 
     1) Убрали материализацию torch.cat([self.ln_prompt(x_prompt), prev_cell_out], dim=-1) 
     и лишние вычсления с одинаковыми x_prompt (которые теперь и не материализуются)
+    2) Оптимизровали применение dense_expand и вычсиление reduce за счет изменения порядка операций на более оптимальный 
     '''
     def __init__(self, n_columns, n_prompts, d_model):
         super().__init__()
@@ -78,8 +79,13 @@ class TromptCell(nn.Module):
         x_column = self.ln_col(self.emb_column.unsqueeze(0).repeat(x_emb.shape[0], 1, 1))
         mask = torch.softmax(x_prompt @ x_column.transpose(1,2), dim=-1)
 
-        x_emb = x_emb.unsqueeze(1) + self.dense_expand(x_emb.unsqueeze(-1)).permute(0, 3, 1, 2)
-        x_out = (mask.unsqueeze(-1) * x_emb).sum(dim=2)
+
+        x_out = torch.bmm(mask, x_emb)  # [B, P, D]
+
+        x_out = (
+            x_out * (1 + self.dense_expand.weight.squeeze(-1)).view(1, -1, 1)
+            + self.dense_expand.bias.view(1, -1, 1)
+        )
         return x_out
 
 
