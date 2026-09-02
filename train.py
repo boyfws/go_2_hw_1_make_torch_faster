@@ -11,7 +11,13 @@ import urllib.request
 from tqdm import tqdm
 
 
+
 class TromptCell(nn.Module):
+    '''
+    Что сделали: 
+    1) Убрали материализацию torch.cat([self.ln_prompt(x_prompt), prev_cell_out], dim=-1) 
+    и лишние вычсления с одинаковыми x_prompt (которые теперь и не материализуются)
+    '''
     def __init__(self, n_columns, n_prompts, d_model):
         super().__init__()
         # Embeddings (Figure 3.2)
@@ -30,6 +36,7 @@ class TromptCell(nn.Module):
         # Modified expansion block (Figure 3.3)
         # Without non-linearities! This is important to make significant speed-ups possible.
         self.dense_expand = nn.Linear(1, n_prompts)
+        self.d_model = d_model
 
         self.reset_parameters()
 
@@ -41,12 +48,33 @@ class TromptCell(nn.Module):
         nn.init.normal_(self.emb_prompt, std=0.01)
 
     def forward(self, x: torch.Tensor, prev_cell_out: torch.Tensor) -> torch.Tensor:
-        x_emb = x.unsqueeze(-1) * self.feature_emb_weight + self.feature_emb_bias.unsqueeze(0)
+        # x - [B, C]
+
+
+        x_emb = x.unsqueeze(-1) * self.feature_emb_weight + self.feature_emb_bias.unsqueeze(0) # [B, C, 1] * [C, D] -> [B, C, D]
         x_emb = F.relu(x_emb)
         x_emb = self.ln_emb(x_emb)
 
-        x_prompt = self.emb_prompt.unsqueeze(0).repeat(x_emb.shape[0], 1, 1)
-        x_prompt = self.dense_imp(torch.cat([self.ln_prompt(x_prompt), prev_cell_out], dim=-1)) + x_prompt
+        x_prompt = self.emb_prompt.unsqueeze(0) # [1, C, D]
+
+        x_prompt = (
+            x_prompt
+            + F.linear(
+                self.ln_prompt(x_prompt),
+                self.dense_imp.weight[:, :self.d_model],
+            )
+            + F.linear(
+                prev_cell_out,
+                self.dense_imp.weight[:, self.d_model:],
+                self.dense_imp.bias,
+            )
+        ) # [B, C, D]
+
+        # Тут можно снизить кол-во копмюта представив данный блок кода в виде суммы 
+        # x_prompt = self.dense_imp(torch.cat([self.ln_prompt(x_prompt), prev_cell_out], dim=-1)) + x_prompt
+
+
+
         x_column = self.ln_col(self.emb_column.unsqueeze(0).repeat(x_emb.shape[0], 1, 1))
         mask = torch.softmax(x_prompt @ x_column.transpose(1,2), dim=-1)
 
