@@ -193,11 +193,33 @@ if __name__ == "__main__":
     device = torch.device('cuda:0')
     model.to(device)
 
+    model = torch.compile(
+        model,
+        dynamic=True,
+        fullgraph=True,
+    )
+
+
+
     train_dl = torch.utils.data.DataLoader(train_dataset, num_workers=0, batch_size=1024, shuffle=True)
     val_dl = torch.utils.data.DataLoader(val_dataset, num_workers=0, batch_size=1024)
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-5)
+    scaler = torch.amp.GradScaler("cuda")
 
     EPOCHS = 5
+
+    # WARMUP
+    with torch.autocast(device_type='cuda', dtype=torch.float16):
+        x = next(iter(val_dl))[0] 
+        x = x.to(device)
+        torch._dynamo.mark_dynamic(
+            x,
+            0,         
+            min=64,
+            max=1024,
+        )            
+        pred = model(x)
+
 
     for e in range(1, EPOCHS + 1):
         model.train()
@@ -209,10 +231,28 @@ if __name__ == "__main__":
         for batch in tqdm(train_dl):
             x, y = batch
             optimizer.zero_grad()
-            pred = model(x.to(device))
-            loss = F.mse_loss(pred, y.unsqueeze(1).repeat(1, len(model.tcells)).to(device))
-            loss.backward()
-            optimizer.step()
+
+            with torch.autocast(device_type='cuda', dtype=torch.float16):
+
+                x = x.to(device)
+
+                torch._dynamo.mark_dynamic(
+                    x,
+                    0,         
+                    min=64,
+                    max=1024,
+                )
+                                
+                pred = model(x)
+
+                loss = F.mse_loss(pred, y.unsqueeze(1).repeat(1, len(model.tcells)).to(device))
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+            #loss.backward()
+            #optimizer.step()
 
             n_samples += x.shape[0]
 
