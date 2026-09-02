@@ -9,7 +9,7 @@ import torch.utils.data
 import os
 import urllib.request
 from tqdm import tqdm
-
+import time
 
 
 class TromptCell(nn.Module):
@@ -161,7 +161,7 @@ if __name__ == "__main__":
     device = torch.device('cuda:0')
     model.to(device)
 
-    train_dl = torch.utils.data.DataLoader(train_dataset, num_workers=0, batch_size=8, shuffle=True)
+    train_dl = torch.utils.data.DataLoader(train_dataset, num_workers=0, batch_size=1024, shuffle=True)
     val_dl = torch.utils.data.DataLoader(val_dataset, num_workers=0, batch_size=1024)
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-5)
 
@@ -169,6 +169,11 @@ if __name__ == "__main__":
 
     for e in range(1, EPOCHS + 1):
         model.train()
+
+        torch.cuda.synchronize()
+        start = time.perf_counter()
+        n_samples = 0
+
         for batch in tqdm(train_dl):
             x, y = batch
             optimizer.zero_grad()
@@ -176,6 +181,13 @@ if __name__ == "__main__":
             loss = F.mse_loss(pred, y.unsqueeze(1).repeat(1, len(model.tcells)).to(device))
             loss.backward()
             optimizer.step()
+
+            n_samples += x.shape[0]
+
+        torch.cuda.synchronize()
+        elapsed = time.perf_counter() - start
+
+        print(f"Train throughput: {n_samples / elapsed:.2f} samples/s")
 
         model.eval()
         mae = 0
