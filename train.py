@@ -114,6 +114,10 @@ class TromptDownstream(nn.Module):
 
 
 class Trompt(nn.Module):
+    """
+    Что сделали ? 
+    1) Убрали repeat в x_prompt, что снижает кол-во вычислений в TromptCell
+    """
     def __init__(self, n_columns, n_prompts, d_model, n_cycles):
         super().__init__()
         self.tcells = nn.ModuleList([TromptCell(n_columns, n_prompts, d_model) for _ in range(n_cycles)])
@@ -125,7 +129,7 @@ class Trompt(nn.Module):
         nn.init.normal_(self.prompt, std=0.01)
 
     def forward(self, x):
-        x_prompt = self.prompt.unsqueeze(0).repeat(x.shape[0], 1, 1)
+        x_prompt = self.prompt.unsqueeze(0)
         outputs = []
         for cell in self.tcells:
             outputs.append(self.tdown(cell(x, x_prompt)))
