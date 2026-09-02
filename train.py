@@ -119,15 +119,28 @@ class TromptDownstream(nn.Module):
         self.dense_out = nn.Linear(d_model, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        pw = torch.softmax(self.dense0(x).squeeze(-1), dim=-1)
-        xnew = (pw.unsqueeze(-1) * x).sum(dim=-2)
-        return self.dense_out(self.ln(F.relu(self.dense1(xnew))))
+        # x: [B, N, P, D]
+
+        pw = torch.softmax(
+            self.dense0(x).squeeze(-1),
+            dim=-1,
+        )  # [B, N, P]
+
+        xnew = torch.matmul(
+            pw.unsqueeze(-2),  # [B, N, 1, P]
+            x,                 # [B, N, P, D]
+        ).squeeze(-2)          # [B, N, D]
+
+        return self.dense_out(
+            self.ln(F.relu(self.dense1(xnew)))
+        )
 
 
 class Trompt(nn.Module):
     """
     Что сделали ? 
     1) Убрали repeat в x_prompt, что снижает кол-во вычислений в TromptCell
+    2) начали применять tdown сразу к всем output0-ам, чтобы лучше утилизрвоать GPU. Внутри tdown перешли на BMM чтобы не создавать большой промежуточный тензор 1500 -> 1900 
     """
     def __init__(self, n_columns, n_prompts, d_model, n_cycles):
         super().__init__()
@@ -141,10 +154,18 @@ class Trompt(nn.Module):
 
     def forward(self, x):
         x_prompt = self.prompt.unsqueeze(0)
-        outputs = []
-        for cell in self.tcells:
-            outputs.append(self.tdown(cell(x, x_prompt)))
-        return torch.stack(outputs, dim=1).squeeze(-1)
+        outputs = [cell(x, x_prompt) for cell in self.tcells]  
+
+        outputs = torch.stack(
+            outputs,
+            dim=1,
+        )
+
+        return self.tdown(
+            outputs
+        ).squeeze(-1)
+        
+        
 
 
 def load_from_url(url, cache_dir='.'):
