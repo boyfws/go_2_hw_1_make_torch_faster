@@ -11,6 +11,11 @@ import urllib.request
 from tqdm import tqdm
 import time
 
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
+
 
 class TromptCell(nn.Module):
     '''
@@ -179,7 +184,16 @@ def load_from_url(url, cache_dir='.'):
 TRAIN_DATA = "https://huggingface.co/datasets/puhsu/hw01-data/resolve/main/train_dataset.pt"
 VAL_DATA = "https://huggingface.co/datasets/puhsu/hw01-data/resolve/main/val_dataset.pt"
 
-if __name__ == "__main__":
+
+def main(rank, world_size):
+    dist.init_process_group(
+        backend="nccl",
+        rank=rank,
+        world_size=world_size,
+    )
+
+    torch.cuda.set_device(rank)
+
     torch.manual_seed(0)
     
     train_dataset = torch.utils.data.TensorDataset(*map(torch.nan_to_num, load_from_url(TRAIN_DATA)))
@@ -190,7 +204,8 @@ if __name__ == "__main__":
     train_dataset.tensors = (train_dataset.tensors[0], (train_dataset.tensors[1] - Y_mean) / Y_std)
 
     model = Trompt(n_columns=train_dataset.tensors[0].shape[1], n_prompts=128, d_model=128, n_cycles=6)
-    device = torch.device('cuda:0')
+
+    device = torch.device(f'cuda:{rank}')
     model.to(device)
 
     model = torch.compile(
@@ -199,10 +214,31 @@ if __name__ == "__main__":
         fullgraph=True,
     )
 
+    model = DDP(
+        model,
+        device_ids=[rank],
+    )
 
+    train_sampler = DistributedSampler(
+        train_dataset,
+        num_replicas=world_size,
+        rank=rank,
+        shuffle=True,
+    )
 
-    train_dl = torch.utils.data.DataLoader(train_dataset, num_workers=0, batch_size=1024, shuffle=True)
-    val_dl = torch.utils.data.DataLoader(val_dataset, num_workers=0, batch_size=1024)
+    train_dl = torch.utils.data.DataLoader(
+        train_dataset,
+        num_workers=0,
+        batch_size=1024,
+        sampler=train_sampler,
+    )
+
+    val_dl = torch.utils.data.DataLoader(
+        val_dataset,
+        num_workers=0,
+        batch_size=1024,
+    )
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-5)
     scaler = torch.amp.GradScaler("cuda")
 
@@ -212,23 +248,30 @@ if __name__ == "__main__":
     with torch.autocast(device_type='cuda', dtype=torch.float16):
         x = next(iter(val_dl))[0] 
         x = x.to(device)
+
         torch._dynamo.mark_dynamic(
             x,
             0,         
             min=64,
             max=1024,
-        )            
+        )
+
         pred = model(x)
 
+    torch.cuda.synchronize()
 
     for e in range(1, EPOCHS + 1):
         model.train()
+
+        train_sampler.set_epoch(e)
+
+        dist.barrier()
 
         torch.cuda.synchronize()
         start = time.perf_counter()
         n_samples = 0
 
-        for batch in tqdm(train_dl):
+        for batch in tqdm(train_dl, disable=(rank != 0)):
             x, y = batch
             optimizer.zero_grad()
 
@@ -245,7 +288,10 @@ if __name__ == "__main__":
                                 
                 pred = model(x)
 
-                loss = F.mse_loss(pred, y.unsqueeze(1).repeat(1, len(model.tcells)).to(device))
+                loss = F.mse_loss(
+                    pred,
+                    y.unsqueeze(1).repeat(1, len(model.module.tcells)).to(device)
+                )
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -259,18 +305,71 @@ if __name__ == "__main__":
         torch.cuda.synchronize()
         elapsed = time.perf_counter() - start
 
-        print(f"Train throughput: {n_samples / elapsed:.2f} samples/s")
+        n_samples_tensor = torch.tensor(
+            n_samples,
+            device=device,
+            dtype=torch.float64,
+        )
 
-        model.eval()
-        mae = 0
-        with torch.inference_mode():
-            for batch in val_dl:
-                x, y = batch
-                pred = model(x.to(device))
-                mae += (pred.mean(dim=-1) * Y_std + Y_mean - y.to(device)).abs().sum().item()
+        dist.all_reduce(
+            n_samples_tensor,
+            op=dist.ReduceOp.SUM,
+        )
 
-            mae = mae / len(val_dataset)
+        elapsed_tensor = torch.tensor(
+            elapsed,
+            device=device,
+            dtype=torch.float64,
+        )
 
-            print(f'>>> Epoch {e:>02}')
-            print(f'Validation MAE = {mae:.5f}')
-            print('>>>\n')
+        dist.all_reduce(
+            elapsed_tensor,
+            op=dist.ReduceOp.MAX,
+        )
+
+        if rank == 0:
+            print(
+                f"Train throughput: "
+                f"{n_samples_tensor.item() / elapsed_tensor.item():.2f} samples/s"
+            )
+
+        if rank == 0:
+            model.eval()
+            mae = 0
+
+            with torch.inference_mode():
+                for batch in val_dl:
+                    x, y = batch
+
+                    pred = model.module(x.to(device))
+
+                    mae += (
+                        pred.mean(dim=-1)
+                        * Y_std
+                        + Y_mean
+                        - y.to(device)
+                    ).abs().sum().item()
+
+                mae = mae / len(val_dataset)
+
+                print(f'>>> Epoch {e:>02}')
+                print(f'Validation MAE = {mae:.5f}')
+                print('>>>\n')
+
+        dist.barrier()
+
+    dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    WORLD_SIZE = 2
+
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = "29500"
+
+    mp.spawn(
+        main,
+        args=(WORLD_SIZE,),
+        nprocs=WORLD_SIZE,
+        join=True,
+    )
